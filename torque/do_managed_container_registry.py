@@ -6,88 +6,159 @@
 
 import base64
 
-from torque import v1
 from torque import container_registry
 from torque import do
 from torque import dolib
+from torque import v1
 
 
-class _V2ContainerRegistry:
+class _V2ContainerRegistry(dolib.Resource):
     """TODO"""
 
-    @classmethod
-    def create(cls,
-               client: dolib.Client,
-               new_obj: dict[str, object]) -> dict[str, object]:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._current_params = None
+
+    def _get(self) -> bool:
         """TODO"""
 
-        res = client.post("v2/registry", new_obj["params"])
+        res = self._client.get("v2/registry")
         data = res.json()
 
-        if res.status_code != 201:
-            raise v1.exceptions.RuntimeError(f"{new_obj['name']}: {data['message']}")
+        if res.status_code == 404:
+            return False
 
-        res = client.get("v2/registry/docker-credentials?"
-                         "read_write=true")
+        if res.status_code != 200:
+            raise v1.exceptions.RuntimeError(f"{self._name}: {data['message']}")
+
+        registry = data["registry"]
+
+        self._current_params = {
+            "name": registry["name"],
+            "region": registry["region"]
+        }
+
+        return True
+
+    def _get_tier(self) -> str:
+        """TODO"""
+
+        res = self._client.get("v2/registry/subscription")
         data = res.json()
 
         if res.status_code != 200:
-            raise v1.exceptions.RuntimeError(f"{new_obj['name']}: {data['message']}")
+            raise v1.exceptions.RuntimeError(f"{self._name}: {data['message']}")
 
-        data = data["auths"]
-        data = list(data.items())
+        subscription = data["subscription"]
 
-        if len(data) != 1:
-            raise v1.exceptions.RuntimeError(f"{new_obj['name']}: invalid response")
+        return subscription["tier"]["slug"]
 
-        data = data[0]
+    def _create(self):
+        """TODO"""
 
-        server = data[0]
-        auth = data[1]["auth"]
+        res = self._client.post("v2/registry", self._object["params"])
+        data = res.json()
 
-        auth = auth.encode()
-        auth = base64.b64decode(auth)
-        auth = auth.decode()
+        if res.status_code != 201:
+            raise v1.exceptions.RuntimeError(f"{self._name}: {data['message']}")
 
-        n = auth.index(":")
+    def _update_tier(self, tier: str):
+        """TODO"""
 
-        username = auth[:n]
-        password = auth[n+1:]
+        res = self._client.post("v2/registry/subscription", {
+            "tier_slug": tier
+        })
 
-        return new_obj | {
-            "metadata": {
-                "server": server,
-                "username": username,
-                "password": password
-            }
+        data = res.json()
+
+        if res.status_code != 200:
+            raise v1.exceptions.RuntimeError(f"{self._name}: {data['message']}")
+
+    def _update(self):
+        """TODO"""
+
+        params = self._object["params"]
+
+        if params["name"] != self._current_params["name"]:
+            raise v1.exceptions.RuntimeError(f"{self._name}: cannot modify registry name")
+
+        if params["region"] != self._current_params["region"]:
+            raise v1.exceptions.RuntimeError(f"{self._name}: cannot modify registry region")
+
+        tier = params["subscription_tier_slug"]
+        current_tier = self._get_tier()
+
+        if tier == current_tier:
+            return
+
+        self._update_tier(tier)
+
+    def update(self) -> dict[str, object]:
+        """TODO"""
+
+        if not self._get():
+            self._create()
+
+        else:
+            self._update()
+
+        return self._object | {
+            "metadata": {}
         }
 
-    @classmethod
-    def update(cls,
-               client: dolib.Client,
-               old_obj: dict[str, object],
-               new_obj: dict[str, object]) -> dict[str, object]:
+    def delete(self):
         """TODO"""
 
-        raise v1.exceptions.RuntimeError(f"{old_obj['name']}: cannot container registry")
+        with self._context as ctx:
+            ctx.delete_secret_data(self._object["name"], "auth")
 
-    @classmethod
-    def delete(cls, client: dolib.Client, old_obj: dict[str, object]):
-        # pylint: disable=W0613
+        res = self._client.delete("v2/registry")
 
-        """TODO"""
+        if res.status_code != 204:
+            raise v1.exceptions.RuntimeError(f"{self._name}: {res.json()['message']}")
 
-        client.delete("v2/registry")
 
-    @classmethod
-    def wait(cls, client: dolib.Client, obj: dict[str, object]):
-        """TODO"""
+def _auth(client: dolib.Client, name: str) -> dict[str, str]:
+    """TODO"""
+
+    res = client.get("v2/registry/docker-credentials?read_write=true")
+    data = res.json()
+
+    if res.status_code != 200:
+        raise v1.exceptions.RuntimeError(f"{name}: {data['message']}")
+
+    data = data["auths"]
+    data = list(data.items())
+
+    if len(data) != 1:
+        raise v1.exceptions.RuntimeError(f"{name}: invalid response")
+
+    data = data[0]
+
+    server = data[0]
+    auth = data[1]["auth"]
+
+    auth = auth.encode()
+    auth = base64.b64decode(auth)
+    auth = auth.decode()
+
+    n = auth.index(":")
+
+    username = auth[:n]
+    password = auth[n+1:]
+
+    return {
+        "server": server,
+        "username": username,
+        "password": password
+    }
 
 
 class V1Provider(v1.provider.Provider):
     """TODO"""
 
-    PARAMETERS = {
+    CONFIGURATION = {
         "defaults": {
             "subscription_tier_slug": "starter"
         },
@@ -110,44 +181,26 @@ class V1Provider(v1.provider.Provider):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self._params = None
-        self._name = None
-        self._prefix = None
+        self._name = f"{self.context.deployment_name}.registry"
+        self._prefix = self._name.replace(".", "-")
 
-        self._load_params()
-        self._create()
+        self._create_registry()
 
-    def _load_params(self):
+    def _create_registry(self):
         """TODO"""
-
-        with self.context as ctx:
-            self._params = ctx.get_data("parameters", v1.utils.fqcn(self))
-
-            if not self._params:
-                self._params = self.parameters
-                ctx.set_data("parameters", v1.utils.fqcn(self), self._params)
-
-    def _create(self):
-        """TODO"""
-
-        name = f"{self.context.deployment_name}.registry"
-        sanitized_name = name.replace(".", "-")
 
         obj = {
             "kind": "v2/registry",
-            "name": name,
+            "name": self._name,
             "params": {
-                "name": sanitized_name,
+                "name": self._prefix,
                 "region": self.interfaces.do.region()
             }
         }
 
-        obj["params"] = v1.utils.merge_dicts(obj["params"], self._params)
+        obj["params"] = v1.utils.merge_dicts(obj["params"], self.configuration)
 
         self.interfaces.do.add_object(obj)
-
-        self._name = self.interfaces.do.object_name(obj)
-        self._prefix = sanitized_name
 
     def prefix(self) -> str:
         """TODO"""
@@ -157,13 +210,14 @@ class V1Provider(v1.provider.Provider):
     def auth(self) -> dict[str, object]:
         """TODO"""
 
-        metadata = self.interfaces.do.object_metadata(self._name)
+        with self.context as ctx:
+            auth = ctx.get_secret_data(self._name, "auth")
 
-        return {
-            "server": metadata["server"],
-            "username": metadata["username"],
-            "password": metadata["password"]
-        }
+            if not auth:
+                auth = _auth(self.interfaces.do.client(), self._name)
+                ctx.set_secret_data(self._name, "auth", auth)
+
+            return auth
 
 
 class V1Client(v1.bond.Bond):
